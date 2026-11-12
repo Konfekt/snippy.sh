@@ -3,7 +3,9 @@
 # Snippet selector with type, yank (clipboard), and paste actions.
 # Requires a GUI session (Wayland or X11) with appropriate tools installed:
 # - Menu: rofi, rofi-wayland, wofi, or fzf
-# - Typing: xdotool, wtype, or ydotool
+# - Typing: X11 uses xdotool. Wayland uses wtype when the compositor
+#   accepts the virtual-keyboard protocol, else ydotool while ydotoold
+#   is running, else wdotool.
 # - Clipboard: wl-copy, xsel, xclip, or pbcopy
 # Snippets are stored as files under a directory (default: $XDG_CONFIG_HOME/snippets).
 
@@ -96,7 +98,7 @@ strip_yaml_front_matter() {
       next
     }
     { print }
-    END { if (in_fm && !stripped) printf "%s", buf }
+    END { if (in_fm && !stripped) printf "%s", buf }''
   ' <"$file"
 }
 
@@ -114,7 +116,8 @@ copy_to_clipboard() {
       "$clipboard_tool" "${clipboard_args[@]}" <"$file"
       ;;
     xsel|xclip)
-      "$clipboard_tool" "${clipboard_args[@]}" <"$file" >/dev/null 2>&1 &
+      # xsel/xclip daemonize after reading stdin; backgrounding races the CLIPBOARD grab
+      "$clipboard_tool" "${clipboard_args[@]}" <"$file" >/dev/null 2>&1
       ;;
     *)
       return 1
@@ -122,22 +125,146 @@ copy_to_clipboard() {
   esac
 }
 
-send_paste_keystroke() {
-  case "${paste_tool:-}" in
-    xdotool)
-      xdotool key --clearmodifiers "${SNIPPY_PASTE_KEY:-ctrl+v}"
-      ;;
-    wtype)
-      [[ "${SNIPPY_PASTE_KEY:-ctrl+v}" == "ctrl+v" ]] || die "wtype paste supports only SNIPPY_PASTE_KEY=ctrl+v"
-      wtype -M ctrl -k v -m ctrl
-      ;;
-    ydotool)
-      ydotool key 29:1 47:1 47:0 29:0
-      ;;
-    *)
-      return 1
-      ;;
+is_vim_context() {
+  case "${SNIPPY_VIM_PASTE:-auto}" in
+    always|1|yes|true) return 0 ;;
+    never|0|no|false) return 1 ;;
   esac
+
+  # Auto-detect works best for GVim/Neovim GUI on X11.  
+  if [[ -n "${DISPLAY:-}" ]] && have xdotool; then
+    local wname wclass
+    wname="$(xdotool getactivewindow getwindowname 2>/dev/null || true)"
+    wclass="$(xdotool getactivewindow getwindowclassname 2>/dev/null || true)"
+    printf '%s\n%s\n' "$wname" "$wclass" | LC_ALL=C grep -Eiq '(^|[^[:alnum:]])(g?vim|n?vim|neovim)([^[:alnum:]]|$)'
+    return $?
+  fi
+
+  return 1
+}
+
+xdotool_combo() {
+  local combo="${1,,}"
+  case "$combo" in
+    ctrl+v) xdotool key --clearmodifiers ctrl+v ;;
+    ctrl+shift+v) xdotool key --clearmodifiers ctrl+shift+v ;;
+    shift+insert|shift+ins) xdotool key --clearmodifiers Shift+Insert ;;
+    insert|ins) xdotool key --clearmodifiers Insert ;;
+    *) return 1 ;;
+  esac
+}
+
+wtype_combo() {
+  local combo="${1,,}"
+  case "$combo" in
+    ctrl+v) wtype -M ctrl -k v -m ctrl ;;
+    ctrl+shift+v) wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
+    shift+insert|shift+ins) wtype -M shift -k Insert -m shift ;;
+    insert|ins) wtype -k Insert ;;
+    *) return 1 ;;
+  esac
+}
+
+ydotool_combo() {
+  local combo="${1,,}"
+  case "$combo" in
+    ctrl+v) ydotool key 29:1 47:1 47:0 29:0 ;;
+    ctrl+shift+v) ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 ;;
+    shift+insert|shift+ins) ydotool key 42:1 110:1 110:0 42:0 ;;
+    insert|ins) ydotool key 110:1 110:0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wdotool_combo() {
+  local combo="${1,,}"
+  case "$combo" in
+    ctrl+v) wdotool key --clearmodifiers ctrl+v ;;
+    ctrl+shift+v) wdotool key --clearmodifiers ctrl+shift+v ;;
+    shift+insert|shift+ins) wdotool key --clearmodifiers shift+Insert ;;
+    insert|ins) wdotool key --clearmodifiers Insert ;;
+    *) return 1 ;;
+  esac
+}
+
+# `-s 1` connects and sleeps 1ms. It types nothing. Failure means this
+# compositor has no virtual-keyboard protocol (Mutter, KWin).
+wtype_protocol() {
+  have wtype || return 1
+  wtype -s 1 >/dev/null 2>&1
+}
+
+ydotool_ready() {
+  have ydotool || return 1
+  pgrep -x ydotoold >/dev/null 2>&1
+}
+
+_send_text_literal() {
+  case "${paste_tool:-}" in
+    xdotool) xdotool type --clearmodifiers --delay 0 -- "$1" ;;
+    wtype) wtype -- "$1" ;;
+    ydotool) ydotool type -- "$1" ;;
+    wdotool) wdotool type --delay 0 --clearmodifiers -- "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+_send_key_backspace() {
+  case "${paste_tool:-}" in
+    xdotool) xdotool key --clearmodifiers BackSpace ;;
+    wtype) wtype -k BackSpace ;;
+    ydotool) ydotool key 14:1 14:0 ;;
+    wdotool) wdotool key --clearmodifiers BackSpace ;;
+    *) return 1 ;;
+  esac
+}
+
+_send_key_escape() {
+  case "${paste_tool:-}" in
+    xdotool) xdotool key --clearmodifiers Escape ;;
+    wtype) wtype -k Escape ;;
+    ydotool) ydotool key 1:1 1:0 ;;
+    wdotool) wdotool key --clearmodifiers Escape ;;
+    *) return 1 ;;
+  esac
+}
+
+_send_combo_any() {
+  local combo="${1:-}"
+  case "${paste_tool:-}" in
+    xdotool) xdotool_combo "$combo" ;;
+    wtype) wtype_combo "$combo" ;;
+    ydotool) ydotool_combo "$combo" ;;
+    wdotool) wdotool_combo "$combo" ;;
+    *) return 1 ;;
+  esac
+}
+
+send_paste_keystroke() {
+  local paste_key="${SNIPPY_PASTE_KEY:-shift+insert}"
+  local vim_paste="${SNIPPY_VIM_PASTE_KEY:-shift+insert}"
+  local prep_mode="${SNIPPY_PASTE_PREP:-always}"               # always|never
+  local prep_delay="${SNIPPY_PASTE_PREP_DELAY_SEC:-0.05}"      # 50ms default
+  local vim_delay="${SNIPPY_VIM_PASTE_DELAY_SEC:-0.05}"
+
+  [[ -n "${paste_tool:-}" ]] || return 1
+
+  if is_vim_context; then
+    _send_key_escape
+    _send_text_literal "o"
+    _send_key_backspace
+    sleep "$vim_delay"
+    _send_combo_any "$vim_paste" || return 1
+    return 0
+  fi
+
+  if [[ "$prep_mode" != "never" ]]; then
+    _send_text_literal "o"
+    _send_key_backspace
+    sleep "$prep_delay"
+  fi
+
+  _send_combo_any "$paste_key" || return 1
 }
 
 type_text() {
@@ -165,6 +292,9 @@ type_text() {
       ;;
     ydotool)
       cat -- "$file" | ydotool type --file -
+      ;;
+    wdotool)
+      wdotool type --delay 0 --clearmodifiers --file "$file"
       ;;
     *)
       die "Unknown typing tool: $type_tool"
@@ -267,12 +397,15 @@ detect_io_tools() {
   clipboard_args=()
 
   if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-    if have wtype; then
+    if wtype_protocol; then
       type_tool="wtype"
       paste_tool="wtype"
-    elif have ydotool; then
+    elif ydotool_ready; then
       type_tool="ydotool"
       paste_tool="ydotool"
+    elif have wdotool; then
+      type_tool="wdotool"
+      paste_tool="wdotool"
     fi
 
     if have wl-copy; then
