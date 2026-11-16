@@ -63,6 +63,16 @@ Options:
   --no-follow   Disable symlink following in file discovery (default: follow).
   --alpha       Sort alphabetically (default: sort by mtime when stat supports it).
   --menu TOOL   Force menu tool: rofi|rofi-wayland|wofi|fzf|auto (default: auto).
+
+Environment:
+  SNIPPY_DIR, SNIPPY_PROMPT_SYMBOL, SNIPPY_MENU   Defaults for --dir, --prompt, --menu.
+  SNIPPY_PASTE_KEY        Paste key: shift+insert (default), ctrl+v, ctrl+shift+v, insert.
+  SNIPPY_PASTE_PREP       always (default) or never: type and erase "o" before pasting.
+  SNIPPY_PASTE_PREP_DELAY_SEC  Delay after that preparation (default: 0.05).
+  SNIPPY_VIM_PASTE        auto (default), always, never: use Vim paste handling.
+  SNIPPY_VIM_PASTE_KEY    Paste key in Vim (default: shift+insert).
+  SNIPPY_VIM_PASTE_DELAY_SEC   Delay before pasting in Vim (default: 0.05).
+  TRACE=1                 Trace execution.
 EOF
 }
 
@@ -82,46 +92,39 @@ while (($#)); do
   esac
 done
 
-strip_yaml_front_matter() {
-  local file="$1"
-  if ! have awk; then
-    cat -- "$file"
-    return 0
-  fi
-  awk '
-    NR==1 { sub(/^\357\273\277/, "", $0) }
-    { sub(/\r$/, "", $0) }
-    NR==1 && $0 ~ /^---[[:space:]]*$/ { in_fm=1; buf=$0 ORS; next }
+# Print a snippet without BOM, CRs, YAML front matter, and leading or trailing
+# blank lines. The output has no final newline so that typing or pasting it
+# does not press Enter at the end.
+render_snippet() {
+  LC_ALL=C awk '
+    function emit(line) {
+      if (line ~ /^[[:space:]]*$/) { if (started) pending = pending "\n" line; return }
+      printf "%s%s", (started ? pending "\n" : ""), line
+      pending = ""; started = 1
+    }
+    NR == 1 { sub(/^\357\273\277/, "") }
+    { sub(/\r$/, "") }
+    NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; n = 0; fm[++n] = $0; next }
     in_fm {
-      buf = buf $0 ORS
-      if ($0 ~ /^(---|\.\.\.)[[:space:]]*$/) { in_fm=0; stripped=1; buf=""; next }
+      fm[++n] = $0
+      if (/^(---|\.\.\.)[[:space:]]*$/) in_fm = 0
       next
     }
-    { print }
-    END { if (in_fm && !stripped) printf "%s", buf }''
-  ' <"$file"
-}
-
-trim_outer_blank_lines() {
-  have sed || { cat; return 0; }
-  # strip initial and trailing whitespace/newlines
-  sed -e '1{/^[[:space:]]*$/d;}' -e '${/^[[:space:]]*$/d;}'
+    { emit($0) }
+    # Unterminated front matter is content, not metadata.
+    END { if (in_fm) for (i = 1; i <= n; i++) emit(fm[i]) }
+  ' <"$1"
 }
 
 copy_to_clipboard() {
   local file="$1"
   [[ -n "${clipboard_tool:-}" ]] || return 1
+  # xsel/xclip daemonize after reading stdin; backgrounding races the CLIPBOARD grab
   case "$clipboard_tool" in
-    wl-copy|pbcopy)
-      "$clipboard_tool" "${clipboard_args[@]}" <"$file"
-      ;;
-    xsel|xclip)
-      # xsel/xclip daemonize after reading stdin; backgrounding races the CLIPBOARD grab
-      "$clipboard_tool" "${clipboard_args[@]}" <"$file" >/dev/null 2>&1
-      ;;
-    *)
-      return 1
-      ;;
+    wl-copy|pbcopy) "$clipboard_tool" <"$file" ;;
+    xsel) xsel --clipboard --input <"$file" >/dev/null 2>&1 ;;
+    xclip) xclip -selection clipboard -in <"$file" >/dev/null 2>&1 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -131,7 +134,7 @@ is_vim_context() {
     never|0|no|false) return 1 ;;
   esac
 
-  # Auto-detect works best for GVim/Neovim GUI on X11.  
+  # Auto-detect works best for GVim/Neovim GUI on X11.
   if [[ -n "${DISPLAY:-}" ]] && have xdotool; then
     local wname wclass
     wname="$(xdotool getactivewindow getwindowname 2>/dev/null || true)"
@@ -143,46 +146,59 @@ is_vim_context() {
   return 1
 }
 
-xdotool_combo() {
-  local combo="${1,,}"
-  case "$combo" in
-    ctrl+v) xdotool key --clearmodifiers ctrl+v ;;
-    ctrl+shift+v) xdotool key --clearmodifiers ctrl+shift+v ;;
-    shift+insert|shift+ins) xdotool key --clearmodifiers Shift+Insert ;;
-    insert|ins) xdotool key --clearmodifiers Insert ;;
+# Send one key (escape, backspace, ctrl+v, ctrl+shift+v, shift+insert, insert)
+# with $type_tool.
+send_key() {
+  local key="${1,,}" k
+  case "$key" in
+    ins) key=insert ;;
+    shift+ins) key=shift+insert ;;
+  esac
+  case "${type_tool:-}" in
+    xdotool|wdotool)
+      case "$key" in
+        escape) k=Escape ;;
+        backspace) k=BackSpace ;;
+        ctrl+v|ctrl+shift+v) k="$key" ;;
+        shift+insert) k=shift+Insert ;;
+        insert) k=Insert ;;
+        *) return 1 ;;
+      esac
+      "$type_tool" key --clearmodifiers "$k"
+      ;;
+    wtype)
+      case "$key" in
+        escape) wtype -k Escape ;;
+        backspace) wtype -k BackSpace ;;
+        ctrl+v) wtype -M ctrl -k v -m ctrl ;;
+        ctrl+shift+v) wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
+        shift+insert) wtype -M shift -k Insert -m shift ;;
+        insert) wtype -k Insert ;;
+        *) return 1 ;;
+      esac
+      ;;
+    ydotool)
+      # Linux input event codes: 1 Esc, 14 BackSpace, 29 LeftCtrl, 42 LeftShift, 47 V, 110 Insert
+      case "$key" in
+        escape) ydotool key 1:1 1:0 ;;
+        backspace) ydotool key 14:1 14:0 ;;
+        ctrl+v) ydotool key 29:1 47:1 47:0 29:0 ;;
+        ctrl+shift+v) ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 ;;
+        shift+insert) ydotool key 42:1 110:1 110:0 42:0 ;;
+        insert) ydotool key 110:1 110:0 ;;
+        *) return 1 ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
 }
 
-wtype_combo() {
-  local combo="${1,,}"
-  case "$combo" in
-    ctrl+v) wtype -M ctrl -k v -m ctrl ;;
-    ctrl+shift+v) wtype -M ctrl -M shift -k v -m shift -m ctrl ;;
-    shift+insert|shift+ins) wtype -M shift -k Insert -m shift ;;
-    insert|ins) wtype -k Insert ;;
-    *) return 1 ;;
-  esac
-}
-
-ydotool_combo() {
-  local combo="${1,,}"
-  case "$combo" in
-    ctrl+v) ydotool key 29:1 47:1 47:0 29:0 ;;
-    ctrl+shift+v) ydotool key 29:1 42:1 47:1 47:0 42:0 29:0 ;;
-    shift+insert|shift+ins) ydotool key 42:1 110:1 110:0 42:0 ;;
-    insert|ins) ydotool key 110:1 110:0 ;;
-    *) return 1 ;;
-  esac
-}
-
-wdotool_combo() {
-  local combo="${1,,}"
-  case "$combo" in
-    ctrl+v) wdotool key --clearmodifiers ctrl+v ;;
-    ctrl+shift+v) wdotool key --clearmodifiers ctrl+shift+v ;;
-    shift+insert|shift+ins) wdotool key --clearmodifiers shift+Insert ;;
-    insert|ins) wdotool key --clearmodifiers Insert ;;
+send_text() {
+  case "${type_tool:-}" in
+    xdotool) xdotool type --clearmodifiers --delay 0 -- "$1" ;;
+    wtype) wtype -- "$1" ;;
+    ydotool) ydotool type -- "$1" ;;
+    wdotool) wdotool type --delay 0 --clearmodifiers -- "$1" ;;
     *) return 1 ;;
   esac
 }
@@ -199,47 +215,6 @@ ydotool_ready() {
   pgrep -x ydotoold >/dev/null 2>&1
 }
 
-_send_text_literal() {
-  case "${paste_tool:-}" in
-    xdotool) xdotool type --clearmodifiers --delay 0 -- "$1" ;;
-    wtype) wtype -- "$1" ;;
-    ydotool) ydotool type -- "$1" ;;
-    wdotool) wdotool type --delay 0 --clearmodifiers -- "$1" ;;
-    *) return 1 ;;
-  esac
-}
-
-_send_key_backspace() {
-  case "${paste_tool:-}" in
-    xdotool) xdotool key --clearmodifiers BackSpace ;;
-    wtype) wtype -k BackSpace ;;
-    ydotool) ydotool key 14:1 14:0 ;;
-    wdotool) wdotool key --clearmodifiers BackSpace ;;
-    *) return 1 ;;
-  esac
-}
-
-_send_key_escape() {
-  case "${paste_tool:-}" in
-    xdotool) xdotool key --clearmodifiers Escape ;;
-    wtype) wtype -k Escape ;;
-    ydotool) ydotool key 1:1 1:0 ;;
-    wdotool) wdotool key --clearmodifiers Escape ;;
-    *) return 1 ;;
-  esac
-}
-
-_send_combo_any() {
-  local combo="${1:-}"
-  case "${paste_tool:-}" in
-    xdotool) xdotool_combo "$combo" ;;
-    wtype) wtype_combo "$combo" ;;
-    ydotool) ydotool_combo "$combo" ;;
-    wdotool) wdotool_combo "$combo" ;;
-    *) return 1 ;;
-  esac
-}
-
 send_paste_keystroke() {
   local paste_key="${SNIPPY_PASTE_KEY:-shift+insert}"
   local vim_paste="${SNIPPY_VIM_PASTE_KEY:-shift+insert}"
@@ -247,24 +222,19 @@ send_paste_keystroke() {
   local prep_delay="${SNIPPY_PASTE_PREP_DELAY_SEC:-0.05}"      # 50ms default
   local vim_delay="${SNIPPY_VIM_PASTE_DELAY_SEC:-0.05}"
 
-  [[ -n "${paste_tool:-}" ]] || return 1
+  [[ -n "${type_tool:-}" ]] || return 1
 
   if is_vim_context; then
-    _send_key_escape
-    _send_text_literal "o"
-    _send_key_backspace
-    sleep "$vim_delay"
-    _send_combo_any "$vim_paste" || return 1
-    return 0
+    send_key escape && send_text "o" && send_key backspace &&
+      sleep "$vim_delay" && send_key "$vim_paste"
+    return
   fi
 
   if [[ "$prep_mode" != "never" ]]; then
-    _send_text_literal "o"
-    _send_key_backspace
-    sleep "$prep_delay"
+    send_text "o" && send_key backspace && sleep "$prep_delay" || return 1
   fi
 
-  _send_combo_any "$paste_key" || return 1
+  send_key "$paste_key"
 }
 
 type_text() {
@@ -272,26 +242,28 @@ type_text() {
   [[ -n "${type_tool:-}" ]] || die "No typing tool available"
   case "$type_tool" in
     xdotool)
-      # Instead of `{ ... } < "$file"` the undocumented `xdotool ... --file $file` switch fails:
-      if {
-      	  IFS= read -r LINE
-      	  xdotool sleep 0.1 type --clearmodifiers --delay 10 -- "$LINE"
-      	  while IFS= read -r LINE; do
-      	  xdotool key Return
-      	  xdotool type --clearmodifiers --delay 1 -- "$LINE"
-      	  done
-      	} < "$file"; then
-      	# Due to stuck modifier keys https://github.com/jordansissel/xdotool/issues/43
-      	xdotool sleep 0.4 keyup Meta_L Meta_R Alt_L Alt_R Super_L Super_R Control_L Control_R Shift_L Shift_R
+      # Type line by line since the undocumented `xdotool type --file` switch fails.
+      local line first=1
+      if while IFS= read -r line || [[ -n "$line" ]]; do
+           if (( first )); then
+             first=0
+             xdotool sleep 0.1 type --clearmodifiers --delay 10 -- "$line"
+           else
+             xdotool key Return
+             xdotool type --clearmodifiers --delay 1 -- "$line"
+           fi
+         done <"$file"; then
+        # Due to stuck modifier keys https://github.com/jordansissel/xdotool/issues/43
+        xdotool sleep 0.4 keyup Meta_L Meta_R Alt_L Alt_R Super_L Super_R Control_L Control_R Shift_L Shift_R
       else
-      	die "xdotool typing failed"
+        die "xdotool typing failed"
       fi
       ;;
     wtype)
-      cat -- "$file" | wtype -
+      wtype - <"$file"
       ;;
     ydotool)
-      cat -- "$file" | ydotool type --file -
+      ydotool type --file - <"$file"
       ;;
     wdotool)
       wdotool type --delay 0 --clearmodifiers --file "$file"
@@ -323,123 +295,84 @@ select_menu_tool() {
   fi
 }
 
+# Print "ACTION<TAB>SELECTION"; both are empty if the menu was cancelled.
+# A command on the left of && or || triggers neither errexit nor the ERR trap,
+# so a cancelled menu is not reported as an error.
 menu_select() {
   local tool="$1"
   local -n _entries="$2"
-  local out rc key sel action
+  local out rc=0 key="" sel="" action=""
 
   case "$tool" in
     rofi|rofi-wayland)
-      local rofi_args=(-dmenu -i -sort -matching fuzzy -p "$prompt_symbol" -kb-custom-1 "Control+y" -kb-custom-2 "Control+t" -kb-custom-3 "Control+p")
-
-      # Save and disable errexit and errtrace for rofi invocation
-      errtrace_was_set=0
-      errexit_was_set=0
-      [[ "$-" == *E* ]] && errtrace_was_set=1
-      [[ "$-" == *e* ]] && errexit_was_set=1
-      old_err_trap="$(trap -p ERR)"
-      set +eE
-      trap ':' ERR
-
-      out="$(printf '%s\n' "${_entries[@]}" | "$tool" "${rofi_args[@]}")"
-      rc=$?
-
-      # Restore errexit and errtrace settings
-      (( errtrace_was_set )) && set -E
-      (( errexit_was_set )) && set -e
-      eval "$old_err_trap"
-
+      out="$("$tool" -dmenu -i -sort -matching fuzzy -p "$prompt_symbol" \
+        -kb-custom-1 "Control+y" -kb-custom-2 "Control+t" -kb-custom-3 "Control+p" \
+        < <(printf '%s\n' "${_entries[@]}"))" || rc=$?
       sel="$out"
       case "$rc" in
         0) action="$action_default" ;;
         10) action="clip" ;;
         11) action="type" ;;
         12) action="paste" ;;
-        *) action="";;
       esac
       ;;
     wofi)
-      set +e
-      out="$(printf '%s\n' "${_entries[@]}" | wofi --dmenu -p "$prompt_symbol")"
-      rc=$?
-      set -e
-      [[ "$rc" -eq 0 ]] || { printf '%s\t%s\n' "" ""; return 0; }
-      sel="$out"
-      action="$action_default"
+      out="$(wofi --dmenu -p "$prompt_symbol" < <(printf '%s\n' "${_entries[@]}"))" || rc=$?
+      if (( rc == 0 )); then
+        sel="$out"
+        action="$action_default"
+      fi
       ;;
     fzf)
-      set +e
-      out="$(printf '%s\n' "${_entries[@]}" | fzf --prompt="$prompt_symbol" --layout=reverse --height=40% --expect=ctrl-y,ctrl-t,ctrl-p)"
-      rc=$?
-      set -e
-      [[ "$rc" -eq 0 ]] || { printf '%s\t%s\n' "" ""; return 0; }
-      key="$(printf '%s\n' "$out" | sed -n '1p')"
-      sel="$(printf '%s\n' "$out" | sed -n '2p')"
-      case "$key" in
-        ctrl-y) action="clip" ;;
-        ctrl-t) action="type" ;;
-        ctrl-p) action="paste" ;;
-        *) action="$action_default" ;;
-      esac
+      out="$(fzf --prompt="$prompt_symbol" --layout=reverse --height=40% \
+        --expect=ctrl-y,ctrl-t,ctrl-p < <(printf '%s\n' "${_entries[@]}"))" || rc=$?
+      if (( rc == 0 )); then
+        { IFS= read -r key; IFS= read -r sel; } <<<"$out" || :
+        case "$key" in
+          ctrl-y) action="clip" ;;
+          ctrl-t) action="type" ;;
+          ctrl-p) action="paste" ;;
+          *) action="$action_default" ;;
+        esac
+      fi
       ;;
     *)
       die "Unknown menu tool: $tool"
       ;;
   esac
 
-  printf '%s\t%s\n' "${action:-}" "${sel:-}"
+  printf '%s\t%s\n' "$action" "$sel"
 }
 
 detect_io_tools() {
+  local clipboards=() tool
   type_tool=""
   clipboard_tool=""
-  paste_tool=""
-  clipboard_args=()
 
   if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
     if wtype_protocol; then
       type_tool="wtype"
-      paste_tool="wtype"
     elif ydotool_ready; then
       type_tool="ydotool"
-      paste_tool="ydotool"
     elif have wdotool; then
       type_tool="wdotool"
-      paste_tool="wdotool"
     fi
-
-    if have wl-copy; then
-      clipboard_tool="wl-copy"
-      clipboard_args=()
-    elif have pbcopy; then
-      clipboard_tool="pbcopy"
-      clipboard_args=()
-    elif have xsel; then
-      clipboard_tool="xsel"
-      clipboard_args=(--clipboard --input)
-    elif have xclip; then
-      clipboard_tool="xclip"
-      clipboard_args=(-selection clipboard -in)
-    fi
+    clipboards=(wl-copy pbcopy xsel xclip)
   elif [[ -n "${DISPLAY:-}" ]]; then
-    have xdotool && type_tool="xdotool" && paste_tool="xdotool"
-    if have xsel; then
-      clipboard_tool="xsel"
-      clipboard_args=(--clipboard --input)
-    elif have xclip; then
-      clipboard_tool="xclip"
-      clipboard_args=(-selection clipboard -in)
-    elif have pbcopy; then
-      clipboard_tool="pbcopy"
-      clipboard_args=()
+    if have xdotool; then
+      type_tool="xdotool"
     fi
+    clipboards=(xsel xclip pbcopy)
   else
-    if have fzf; then
-      die "No GUI session detected for typing or pasting"
-    else
-      die "No Wayland or X11 display detected"
-    fi
+    die "No Wayland or X11 display detected"
   fi
+
+  for tool in "${clipboards[@]}"; do
+    if have "$tool"; then
+      clipboard_tool="$tool"
+      break
+    fi
+  done
 }
 
 stat_style="none"
@@ -455,10 +388,11 @@ detect_stat_style() {
 }
 
 file_mtime() {
-  local f="$1"
+  local f="$1" deref=()
+  (( follow_symlinks )) && deref=(-L)
   case "$stat_style" in
-    gnu) stat -c %Y -- "$f" ;;
-    bsd) stat -f %m -- "$f" ;;
+    gnu) stat "${deref[@]}" -c %Y -- "$f" ;;
+    bsd) stat "${deref[@]}" -f %m -- "$f" ;;
     *) printf '0\n' ;;
   esac
 }
@@ -475,83 +409,62 @@ main() {
   find_args=()
   (( follow_symlinks )) && find_args+=(-L)
 
-  files=()
-  while IFS= read -r -d '' f; do
-    files+=("$f")
-  done < <(
-    find "${find_args[@]}" "$store_dir" -type f \
-      -not -path '*/.git/*' -not -name '.gitignore' \
-      -print0
-  )
-
-  ((${#files[@]})) || die "No snippet files found under: $store_dir"
-
   entries=()
-  if (( include_all )); then
-    for f in "${files[@]}"; do
-      entries+=("${f#"$store_dir"/}")
-    done
-  else
-    for f in "${files[@]}"; do
-      rel="${f#"$store_dir"/}"
+  while IFS= read -r -d '' f; do
+    rel="${f#"$store_dir"/}"
+    if (( include_all )); then
+      entries+=("$rel")
+    else
       case "$rel" in
         *.txt|*.md) entries+=("$rel") ;;
       esac
-    done
-  fi
+    fi
+  done < <(
+    find "${find_args[@]}" "$store_dir" -name .git -prune -o \
+      -type f -not -name '.gitignore' -print0
+  )
   ((${#entries[@]})) || die "No matching snippet files found under: $store_dir"
 
+  sorted=()
   if (( sort_recent )) && [[ "$stat_style" != "none" ]]; then
-    sortable=()
-    for f in "${files[@]}"; do
-      rel="${f#"$store_dir"/}"
-      if (( include_all )); then
-        :
-      else
-        case "$rel" in *.txt|*.md) : ;; *) continue ;; esac
-      fi
-      sortable+=( "$(file_mtime "$f")"$'\t'"$rel" )
-    done
-    entries=()
     while IFS=$'\t' read -r _mtime rel; do
-      entries+=("$rel")
-    done < <(printf '%s\n' "${sortable[@]}" | LC_ALL=C sort -nr)
+      sorted+=("$rel")
+    done < <(
+      for rel in "${entries[@]}"; do
+        printf '%s\t%s\n' "$(file_mtime "$store_dir/$rel")" "$rel"
+      done | LC_ALL=C sort -nr
+    )
   else
-    entries_sorted=()
-    while IFS= read -r line; do entries_sorted+=("$line"); done < <(printf '%s\n' "${entries[@]}" | LC_ALL=C sort)
-    entries=("${entries_sorted[@]}")
+    while IFS= read -r rel; do
+      sorted+=("$rel")
+    done < <(printf '%s\n' "${entries[@]}" | LC_ALL=C sort)
   fi
+  entries=("${sorted[@]}")
 
   menu_result="$(menu_select "$menu_tool" entries)"
 
   action="${menu_result%%$'\t'*}"
   selection="${menu_result#*$'\t'}"
-  [[ -n "${selection:-}" ]] || exit 0
-  [[ -n "${action:-}" ]] || exit 0
+  [[ -n "$selection" && -n "$action" ]] || exit 0
 
+  # Menus such as rofi also return typed text, so accept listed entries only;
+  # this also keeps the selection inside the snippet directory.
+  found=0
+  for rel in "${entries[@]}"; do
+    if [[ "$rel" == "$selection" ]]; then
+      found=1
+      break
+    fi
+  done
+  (( found )) || die "Not a snippet: $selection"
   selected_file="$store_dir/$selection"
   [[ -f "$selected_file" ]] || die "Selected file not found: $selected_file"
-
-  if (( follow_symlinks )); then
-    :
-  else
-    if have realpath; then
-      real_selected="$(realpath -- "$selected_file")" || die "Failed to resolve selected path"
-      [[ "$real_selected" == "$store_dir/"* ]] || die "Refuse path traversal outside store_dir: $selection"
-      selected_file="$real_selected"
-    else
-      case "$selection" in
-        /*|*'..'*) die "Refuse suspicious selection path: $selection" ;;
-        *) ;;
-      esac
-    fi
-  fi
 
   have mktemp || die "mktemp not found"
   tmp_file="$(mktemp -t snippy.XXXXXX)"
   trap 'rm -f -- "$tmp_file"' EXIT
 
-  strip_yaml_front_matter "$selected_file" | trim_outer_blank_lines >"$tmp_file"
+  render_snippet "$selected_file" >"$tmp_file"
 
   case "$action" in
     clip)
@@ -573,4 +486,4 @@ main() {
   esac
 }
 
-main "$@"
+main
