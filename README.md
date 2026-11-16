@@ -22,7 +22,7 @@ This works quite universally, that is, in every text box, editor, ... because th
 
 `Enter` performs the action given on the command line.
 Pasting presses `Shift+Insert` by default; set `SNIPPY_PASTE_KEY` to `ctrl+v`, `ctrl+shift+v` or `insert` to change it.
-In (G)Vim or Neovim windows, detected on X11 by the window title or class, it first leaves to Normal mode; set `SNIPPY_VIM_PASTE` to `always` or `never` to override the detection.
+In (G)Vim or Neovim windows it first leaves to Normal mode. On X11 such a window is recognized by a Vim GUI's window class, by Vim's default title (ending in `- VIM`, `- GVIM` or `- Nvim`), or by a title that the shell sets to the running command (such as `vim notes.txt`); a title that merely contains "vim" does not count. Set `SNIPPY_VIM_PASTE` to `always` or `never` to override the detection.
 See `snippy.sh --help` for all options and environment variables.
 
 ## Dependencies

@@ -20,11 +20,18 @@ fi
 PS4='+\t '
 [[ ! -t 0 ]] && [[ -n "$DBUS_SESSION_BUS_ADDRESS" ]] && command -v notify-send > /dev/null 2>&1 && notify=1
 error_handler() {
-  summary="Error: In ${BASH_SOURCE[0]}, Lines $1 and $2, Command $3 exited with Status $4"
-  body=$(pr -tn "${BASH_SOURCE[0]}" | tail -n+$(($1 - 3)) | head -n7 | sed '4s/^\s*/>> /')
-  echo >&2 -en "$summary\n$body"
-  [ -z "${notify:+x}" ] || notify-send --urgency=critical "$summary" "$body"
-  exit "$4"
+  trap - ERR
+  set +o errexit
+  local line="${1:-?}" status="${4:-1}" summary body="" start
+  summary="Error: In ${BASH_SOURCE[0]}, Lines $1 and $2, Command $3 exited with Status $status"
+  # Show the failing line in context, if `pr` is available and the line is known.
+  if [[ "$line" =~ ^[0-9]+$ ]] && have pr; then
+    start=$(( line > 3 ? line - 3 : 1 ))
+    body=$(pr -tn "${BASH_SOURCE[0]}" | tail -n "+$start" | head -n7 | sed "$(( line - start + 1 ))s/^[[:space:]]*/>> /")
+  fi
+  printf '%s\n%s\n' "$summary" "$body" >&2
+  [ -z "${notify:+x}" ] || notify-send --urgency=critical "$summary" "$body" || true
+  exit "$status"
 }
 trap 'error_handler $LINENO "$BASH_LINENO" "$BASH_COMMAND" $?' ERR
 
@@ -134,13 +141,20 @@ is_vim_context() {
     never|0|no|false) return 1 ;;
   esac
 
-  # Auto-detect works best for GVim/Neovim GUI on X11.
+  # Auto-detect works on X11 only: by a Vim GUI's window class, by Vim's
+  # default title ("file (dir) - VIM", "- GVIM1", "- Nvim"), or by a title
+  # that a shell sets to the running command ("vim file"). A title merely
+  # containing "vim", say a browser tab on "vim-plugin", must not count:
+  # pasting there would send Escape.
   if [[ -n "${DISPLAY:-}" ]] && have xdotool; then
     local wname wclass
     wname="$(xdotool getactivewindow getwindowname 2>/dev/null || true)"
     wclass="$(xdotool getactivewindow getwindowclassname 2>/dev/null || true)"
-    printf '%s\n%s\n' "$wname" "$wclass" | LC_ALL=C grep -Eiq '(^|[^[:alnum:]])(g?vim|n?vim|neovim)([^[:alnum:]]|$)'
-    return $?
+    wname="${wname,,}" wclass="${wclass,,}"
+    [[ "$wclass" =~ ^(g?vim|n?vim|nvim-qt|neovide|gnvim|goneovim)$ ||
+       "$wname" =~ \ -\ [gn]?vim[0-9]*$ ||
+       "$wname" =~ ^(sudo(edit)?\ )?(g?vim|n?vim|nvim|vi|view|vimdiff|nvim-qt)(\ |$) ]]
+    return
   fi
 
   return 1
@@ -326,6 +340,8 @@ menu_select() {
     fzf)
       out="$(fzf --prompt="$prompt_symbol" --layout=reverse --height=40% \
         --expect=ctrl-y,ctrl-t,ctrl-p < <(printf '%s\n' "${_entries[@]}"))" || rc=$?
+      # 1: no match, 130: cancelled; 2: error, such as no terminal.
+      (( rc != 2 )) || die "fzf failed (it needs a terminal; install rofi or wofi for a key binding)"
       if (( rc == 0 )); then
         { IFS= read -r key; IFS= read -r sel; } <<<"$out" || :
         case "$key" in
@@ -402,7 +418,9 @@ main() {
   store_dir="$(cd -P -- "$store_dir" 2>/dev/null && pwd -P)" || die "Snippet directory invalid: $store_dir"
 
   detect_io_tools
-  menu_tool="$(select_menu_tool "$menu_pref")"
+  # `|| exit`: a die in the subshell already reported its error, so the
+  # ERR trap must not report it again.
+  menu_tool="$(select_menu_tool "$menu_pref")" || exit
 
   detect_stat_style
 
@@ -441,7 +459,7 @@ main() {
   fi
   entries=("${sorted[@]}")
 
-  menu_result="$(menu_select "$menu_tool" entries)"
+  menu_result="$(menu_select "$menu_tool" entries)" || exit
 
   action="${menu_result%%$'\t'*}"
   selection="${menu_result#*$'\t'}"
