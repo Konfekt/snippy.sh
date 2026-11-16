@@ -29,6 +29,12 @@ for tool in xdotool wtype; do
   # shellcheck disable=SC2016
   printf '#!/usr/bin/env bash\nprintf "%s %%s\\n" "$*" >>"$LOG"\n' "$tool" >"$stubs/$tool"
 done
+# xdotool reports $WIN_NAME and $WIN_CLASS as the active window.
+cat >>"$stubs/xdotool" <<'STUB'
+[[ "$*" == "getactivewindow getwindowname" ]] && printf '%s\n' "${WIN_NAME:-}"
+[[ "$*" == "getactivewindow getwindowclassname" ]] && printf '%s\n' "${WIN_CLASS:-}"
+exit 0
+STUB
 # wtype -s 1 probes the protocol; `wtype -` reads text from stdin.
 cat >>"$stubs/wtype" <<'STUB'
 [[ "$*" == - ]] && { printf 'stdin:'; cat; printf '|\n'; } >>"$LOG"
@@ -130,6 +136,39 @@ wtype -
 stdin:line 1
 
   line 2|" "$(cat "$log")"
+
+vim_paste_for() { # WINDOW_NAME WINDOW_CLASS -> "vim" or "plain"
+  run FZF_PICK=LGTM WIN_NAME="$1" WIN_CLASS="$2" -- --paste
+  if grep -q Escape "$log"; then echo vim; else echo plain; fi
+}
+check "Vim title detected" vim "$(vim_paste_for 'notes.txt (~/doc) - VIM' XTerm)"
+check "GVim server title detected" vim "$(vim_paste_for 'notes.txt (~/doc) - GVIM1' Gvim)"
+check "Neovim title detected" vim "$(vim_paste_for 'notes.txt - Nvim' kitty)"
+check "shell-set title detected" vim "$(vim_paste_for 'nvim notes.txt' Alacritty)"
+check "Vim GUI class detected" vim "$(vim_paste_for 'untitled' neovide)"
+check "browser tab on a Vim plugin is not Vim" plain \
+  "$(vim_paste_for 'Konfekt/vim-CtrlXA: increment - Mozilla Firefox' firefox)"
+check "editor named like Vim is not Vim" plain "$(vim_paste_for 'evim-notes - Kate' kate)"
+
+out="$(run FZF_RC=2 -- 2>&1)" && rc=0 || rc=$?
+check "fzf error is reported once" "1 Error: fzf failed (it needs a terminal; install rofi or wofi for a key binding)" "$rc $out"
+
+out="$(run -- --menu bogus 2>&1)" && rc=0 || rc=$?
+check "missing menu tool is reported once" "1 Error: Menu tool not found: bogus" "$rc $out"
+
+# A failing command without `pr` on PATH still reports the error.
+nopr="$work/nopr"
+mkdir -p "$nopr"
+for tool in bash env cat find sort awk sed head tail mktemp stat rm; do
+  ln -s "$(command -v "$tool")" "$nopr/$tool"
+done
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\n[[ $1 == -s ]] || exit 3\n' >"$nopr/wtype"
+cp "$stubs/fzf" "$nopr/fzf"
+chmod +x "$nopr/wtype"
+out="$(env -i HOME="$work" WAYLAND_DISPLAY=w PATH="$nopr" FZF_PICK=LGTM LOG="$log" \
+  "$nopr/bash" "$script" --menu fzf --dir "$snippets" --type 2>&1)" && rc=0 || rc=$?
+check "error without pr is reported" "3 yes" "$rc $(grep -q '^Error: In .*exited with Status 3' <<<"$out" && echo yes)"
 
 out="$(env -u WAYLAND_DISPLAY -u DISPLAY bash "$script" --dir "$snippets" 2>&1)" && rc=0 || rc=$?
 check "no display" "1 Error: No Wayland or X11 display detected" "$rc $out"
