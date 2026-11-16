@@ -2,34 +2,53 @@ In the quest for an analogue on Linux of [Autohotkey](https://autohotkey.com) th
 
 # Use
 
-Instead, this little shell script `snippy.sh` that depends on
+Instead, this little shell script `snippy.sh` lets you fuzzily select a snippet from a popup menu and then types it out, copies it to the clipboard, or pastes it into the focused window.
 
-- [xdotool](https://github.com/jordansissel/xdotool), and
-- [rofi](https://github.com/davatorium/rofi) (or `dmenu`)
+Each snippet, say `LGTM`, is a file `LGTM` in the snippet directory `~/.config/snippets` (or `$XDG_CONFIG_HOME/snippets`; override with `--dir DIR` or `$SNIPPY_DIR`), and subdirectories work too.
+For example, if `~/.config/snippets/LGTM` reads `Looks good to me!`, then fuzzily selecting `LGTM` writes out `Looks good to me!`.
+Snippets are listed by most recently modified first (`--alpha` sorts by name), and `--text-only` lists only `*.txt` and `*.md` files.
 
-expands (by typing it out via `xdotool`) a fuzzily selected string from a popup menu (provided by `rofi`).
+Before use, a snippet's YAML front matter (a leading block between `---` lines), a byte order mark, carriage returns and leading and trailing blank lines are removed, so the final line is not followed by Enter.
 
-Each such string, say `LGTM`, is stored as the name of a file `~/.snippy/LGTM` inside `~/.snippy` that expands to the content of the file.
-For example, if `~/.snippy/LGTM` reads `Looks good to me!`, then fuzzily selecting `LGTM` writes out `Looks good to me!`.
+This works quite universally, that is, in every text box, editor, ... because the snippet is typed by simulated key presses.
 
-This works quite universally, that is, in every text box, editor, ... because `xdotool` simulates key presses.
+## Actions
 
-To call it by a global key binding, a daemon such as [xbindkeys](https://wiki.archlinux.org/index.php/Xbindkeys) (or [sxhkd](https://wiki.archlinux.org/index.php/Sxhkd)) is needed.
+| Option            | Key in rofi or fzf | Action                                                         |
+|-------------------|--------------------|----------------------------------------------------------------|
+| `--type` (default)| `Ctrl+T`           | Type the snippet into the focused window.                       |
+| `--clip`          | `Ctrl+Y`           | Copy the snippet to the clipboard.                              |
+| `--paste`         | `Ctrl+P`           | Copy to the clipboard, then press a paste key (falls back to typing). |
+
+`Enter` performs the action given on the command line.
+Pasting presses `Shift+Insert` by default; set `SNIPPY_PASTE_KEY` to `ctrl+v`, `ctrl+shift+v` or `insert` to change it.
+In (G)Vim or Neovim windows, detected on X11 by the window title or class, it first leaves to Normal mode; set `SNIPPY_VIM_PASTE` to `always` or `never` to override the detection.
+See `snippy.sh --help` for all options and environment variables.
+
+## Dependencies
+
+- `bash` 4.3 or newer, and `awk`, `find` and `sort`.
+- A menu: [rofi](https://github.com/davatorium/rofi) (`rofi-wayland` on Wayland), [wofi](https://hg.sr.ht/~scoopta/wofi), or [fzf](https://github.com/junegunn/fzf) (which needs a terminal); force one with `--menu`.
+- For typing and pasting:
+  - on X11, [xdotool](https://github.com/jordansissel/xdotool);
+  - on Wayland, [wtype](https://github.com/atx/wtype) if the compositor supports the virtual keyboard protocol (not GNOME or KDE), else [ydotool](https://github.com/ReimuNotMoe/ydotool) with `ydotoold` running, else `wdotool`.
+- For the clipboard: `wl-copy` (Wayland), `xsel` or `xclip` (X11), or `pbcopy`.
 
 # Installation
 
-1. Save this script, say to `~/bin/snippy.sh` by
+1. Save this script, say to `~/bin/snippy.sh`, by
 
     ```sh
-    mkdir --parents ~/bin &&
-    curl -fLo https://raw.githubusercontent.com/Konfekt/snippy.sh/master/snippy.sh ~/bin/snippy.sh
+    mkdir -p ~/bin &&
+    curl -fLo ~/bin/snippy.sh https://raw.githubusercontent.com/Konfekt/snippy.sh/master/snippy.sh
     ```
-  
-1. mark it executable by `chmod a+x ~/bin/snippy.sh`,
 
-To launch `snippy.sh` by a global keyboard shortcut, say by pressing, at the same time, the `Microsoft Windows` key and `S`:
+1. mark it executable by `chmod a+x ~/bin/snippy.sh`, and
+1. put your snippets into `~/.config/snippets`.
 
-1. install `xdotool`, `rofi` and, say, `Xbindkeys` (or `Sxhkd`), (for example, on `openSUSE` by `sudo zypper install xbindkeys` respectively `sudo zypper install xdotool rofi sxhkd`)
+To launch `snippy.sh` by a global keyboard shortcut, say by pressing, at the same time, the `Microsoft Windows` key and `S`, use the keyboard shortcut settings of your desktop environment or, on X11, a daemon such as [xbindkeys](https://wiki.archlinux.org/index.php/Xbindkeys) (or [sxhkd](https://wiki.archlinux.org/index.php/Sxhkd)):
+
+1. install `xdotool`, `rofi` and, say, `xbindkeys` (for example, on `openSUSE` by `sudo zypper install xdotool rofi xbindkeys`),
 1. add to `~/.xbindkeysrc` a key binding that launches `snippy.sh`, say
 
     ```sh
@@ -47,6 +66,10 @@ xbindkeys
 ```
 
 into `~/.config/autostart-scripts/`.
+
+# Tests
+
+`tests/test.sh` runs `snippy.sh` against stub menu, typing and clipboard tools, so it needs no display.
 
 # Credits
 
